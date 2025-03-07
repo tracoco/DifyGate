@@ -17,12 +17,13 @@ func RegisterRoutes(r *gin.Engine, mailService *gate.Service, log *logrus.Logger
 	// API versioning
 	v1 := r.Group("/api/v1")
 
+	handler := NewWhatsAppHandler(log)
 	// WhatsApp webhook endpoints - NOT protected by auth (needed for Meta verification)
 	whatsapp := v1.Group("/whatsapp")
 	{
 		// Handler for WhatsApp webhook verification (GET) and messages (POST)
-		whatsapp.GET("/webhook", HandleWhatsAppWebhookGet)
-		whatsapp.POST("/webhook", HandleWhatsAppWebhookPost)
+		whatsapp.GET("/webhook", handler.HandleWhatsAppWebhookGet)
+		whatsapp.POST("/webhook", handler.HandleWhatsAppWebhookPost)
 	}
 
 	// Protected routes - require API key
