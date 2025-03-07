@@ -159,7 +159,7 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 	sendReplyMessage(phoneNumberID, from, initialResponse, messageID)
 
 	// Create context with reasonable timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	// Use user's WhatsApp number as the conversation ID to maintain context
@@ -175,20 +175,24 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 		ResponseMode:   "streaming", // Use streaming for real-time responses
 	}
 
-	// Start streaming response from Dify
+	// Log what we're doing
 	h.log.WithFields(logrus.Fields{
-		"userID": userID,
-		"query":  messageBody,
+		"userID":         userID,
+		"query":          messageBody,
+		"conversationID": "whatsapp_" + userID,
 	}).Info("Sending request to Dify")
 
+	// Start streaming response from Dify
 	respChan, errChan := h.difyHandler.DifyChatMessageStreaming(ctx, difyReq)
 
 	// Variables to build the complete response
 	var fullAnswer strings.Builder
 	var lastMessageSent time.Time
-	var lastChunkSize int
-	const minSendInterval = 1500 * time.Millisecond // Minimum 1.5 seconds between messages
-	const minChunkSize = 50                         // Minimum characters per chunk
+	lastMessageSent = time.Now() // Initialize to now to prevent immediate send
+
+	// Constants for message handling
+	const minSendInterval = 3 * time.Second // Minimum time between messages (prevent rate limiting)
+	const minChunkSize = 100                // Minimum characters per message
 
 	// Process streaming responses
 	for {
@@ -206,41 +210,64 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 			return
 
 		case resp, ok := <-respChan:
-			h.log.WithField("response", resp).Info("Received Dify response")
 			if !ok {
 				// Response channel closed, stream completed
+				h.log.Info("Dify response stream completed")
+
 				// Send any remaining text
 				if fullAnswer.Len() > 0 {
-					sendReplyMessage(phoneNumberID, from, fullAnswer.String(), messageID)
+					finalResponse := fullAnswer.String()
+					h.log.WithField("final_response", finalResponse).Info("Sending final response")
+					sendReplyMessage(phoneNumberID, from, finalResponse, messageID)
 				}
 				return
 			}
 
-			// Only process message chunks from the "message_delta" event
-			if resp.Event == "message_delta" && resp.Answer != "" {
-				// Accumulate the answer
-				fullAnswer.WriteString(resp.Answer)
+			// Log each response we get
+			h.log.WithFields(logrus.Fields{
+				"event":  resp.Event,
+				"answer": resp.Answer,
+				"id":     resp.ID,
+			}).Info("Received Dify response chunk")
 
-				// Determine if we should send a partial response
-				timeSinceLastMessage := time.Since(lastMessageSent)
-				currentSize := fullAnswer.Len()
+			// Process different event types
+			switch resp.Event {
+			case "message_start":
+				// First message in the stream, reset
+				fullAnswer.Reset()
 
-				// Send partial response if enough time has passed and we have enough new content
-				if timeSinceLastMessage > minSendInterval && (currentSize-lastChunkSize) >= minChunkSize {
-					partialResponse := fullAnswer.String()
-					sendReplyMessage(phoneNumberID, from, partialResponse, messageID)
+			case "agent_message":
+				// Add to the answer if there's content
+				if resp.Answer != "" {
+					fullAnswer.WriteString(resp.Answer)
 
-					// Reset buffer after sending
-					fullAnswer.Reset()
-					lastChunkSize = 0
-					lastMessageSent = time.Now()
+					// Check if we should send a partial message
+					if time.Since(lastMessageSent) >= minSendInterval && fullAnswer.Len() >= minChunkSize {
+						partialResponse := fullAnswer.String()
+						h.log.WithField("partial_response", partialResponse).Info("Sending partial response")
+						sendReplyMessage(phoneNumberID, from, partialResponse, messageID)
+
+						// Reset and update timing
+						fullAnswer.Reset()
+						lastMessageSent = time.Now()
+					}
 				}
-			} else if resp.Event == "message_end" {
-				// Message is complete, send any remaining text
+
+			case "message_end":
+				// Send final message if there's anything left
 				if fullAnswer.Len() > 0 {
 					finalResponse := fullAnswer.String()
+					h.log.WithField("final_response", finalResponse).Info("Sending final message")
 					sendReplyMessage(phoneNumberID, from, finalResponse, messageID)
 				}
+				return
+
+			case "error":
+				// Handle error events
+				errMsg := fmt.Sprintf("Error from AI: %s", resp.ErrorMsg)
+				h.log.Error(errMsg)
+				sendReplyMessage(phoneNumberID, from, errMsg, messageID)
+				return
 			}
 
 		case <-ctx.Done():
@@ -249,6 +276,18 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 			timeoutMessage := "Sorry, the response took too long. Please try again later."
 			sendReplyMessage(phoneNumberID, from, timeoutMessage, messageID)
 			return
+
+		case <-time.After(15 * time.Second):
+			// No messages for 15 seconds but we have accumulated text
+			if fullAnswer.Len() >= minChunkSize {
+				partialResponse := fullAnswer.String()
+				h.log.WithField("timeout_response", partialResponse).Info("Sending response after timeout")
+				sendReplyMessage(phoneNumberID, from, partialResponse, messageID)
+
+				// Reset and update timing
+				fullAnswer.Reset()
+				lastMessageSent = time.Now()
+			}
 		}
 	}
 }
@@ -274,8 +313,19 @@ func (h *WhatsAppHandler) HandleWhatsAppWebhookGet(c *gin.Context) {
 	}
 }
 
+// sendReplyMessage sends a reply to a WhatsApp message
 func sendReplyMessage(phoneNumberID, to, messageBody, messageID string) {
+	if messageBody == "" {
+		log.Println("Warning: Attempted to send empty message, skipping")
+		return
+	}
+
 	graphAPIToken := os.Getenv("DIFYGATE_GRAPH_API_TOKEN")
+	if graphAPIToken == "" {
+		log.Println("Error: DIFYGATE_GRAPH_API_TOKEN is not set")
+		return
+	}
+
 	url := fmt.Sprintf("https://graph.facebook.com/v22.0/%s/messages", phoneNumberID)
 
 	// Truncate message if too long for WhatsApp (limit is around 4096 characters)
@@ -301,6 +351,15 @@ func sendReplyMessage(phoneNumberID, to, messageBody, messageID string) {
 		return
 	}
 
+	// Log what we're about to send
+	if os.Getenv("DIFYGATE_DEBUG") == "true" {
+		log.Printf("Sending WhatsApp message to %s (length: %d): %s", to, len(messageBody), messageBody)
+		var prettyJSON bytes.Buffer
+		if err := json.Indent(&prettyJSON, payloadBytes, "", "  "); err == nil {
+			log.Printf("WhatsApp API request payload: %s", prettyJSON.String())
+		}
+	}
+
 	// Create HTTP request
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
 	if err != nil {
@@ -311,8 +370,10 @@ func sendReplyMessage(phoneNumberID, to, messageBody, messageID string) {
 	req.Header.Set("Authorization", "Bearer "+graphAPIToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	// Send request
-	client := &http.Client{}
+	// Send request with timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Failed to send reply: %v", err)
@@ -320,10 +381,18 @@ func sendReplyMessage(phoneNumberID, to, messageBody, messageID string) {
 	}
 	defer resp.Body.Close()
 
+	// Check response status
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("WhatsApp API error (status %d): %s", resp.StatusCode, string(respBody))
+		return
+	}
+
 	// Log response for debugging
 	if os.Getenv("DIFYGATE_DEBUG") == "true" {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("WhatsApp API response: %s", respBody)
+		log.Printf("WhatsApp API response: %s", string(respBody))
+	} else {
+		log.Printf("Message sent successfully to %s", to)
 	}
 }
 

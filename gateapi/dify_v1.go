@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -180,8 +181,8 @@ func (h *DifyHandler) DifyChatMessage(req DifyChatMessageRequest) (*ChatMessageR
 // DifyChatMessageStreaming sends a message to Dify API and returns the response as a stream
 func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChatMessageRequest) (chan StreamingChatResponse, chan error) {
 	// Initialize channels for the stream
-	responseChan := make(chan StreamingChatResponse)
-	errChan := make(chan error, 1) // Buffered to avoid blocking
+	responseChan := make(chan StreamingChatResponse, 100) // Buffer to prevent blocking
+	errChan := make(chan error, 1)                        // Buffered to avoid blocking
 
 	// Enforce streaming mode
 	req.ResponseMode = "streaming"
@@ -202,7 +203,10 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 
 		// Log beautified request for debugging
 		if os.Getenv("DIFYGATE_DEBUG") == "true" {
-			h.log.WithField("dify_request", difyReq).Info("Sending Dify streaming request")
+			prettyJSON, err := json.MarshalIndent(difyReq, "", "  ")
+			if err == nil {
+				h.log.WithField("dify_request", string(prettyJSON)).Info("Dify streaming request")
+			}
 		}
 
 		// Convert request to JSON
@@ -232,8 +236,16 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 			httpReq.Header.Set("X-Client-Id", h.difyClientID)
 		} */
 
+		// Log detailed request info
+		h.log.WithFields(logrus.Fields{
+			"url":    url,
+			"method": "POST",
+		}).Info("Sending streaming request to Dify API")
+
 		// Send request
-		client := &http.Client{}
+		client := &http.Client{
+			Timeout: 0, // No timeout for streaming requests
+		}
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			h.log.WithError(err).Error("Failed to send streaming request to Dify API")
@@ -253,61 +265,87 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 			return
 		}
 
+		// Log that we're starting to process the stream
+		h.log.Info("Starting to process Dify SSE stream")
+
 		// Process the SSE stream
-		reader := bufio.NewReader(resp.Body)
-		for {
-			// Check if context is done
+		scanner := bufio.NewScanner(resp.Body)
+		var eventData []byte
+
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			// Debug each line received in the SSE stream
+			if os.Getenv("DIFYGATE_DEBUG") == "true" {
+				h.log.WithField("sse_line", line).Debug("Received SSE line")
+			}
+
+			// Empty line signals the end of an event
+			if line == "" {
+				if len(eventData) > 0 {
+					// Process complete event
+					processEvent(eventData, responseChan, h.log)
+					eventData = nil
+				}
+				continue
+			}
+
+			// Lines starting with "data:" contain the event data
+			if strings.HasPrefix(line, "data:") {
+				data := strings.TrimPrefix(line, "data:")
+				data = strings.TrimSpace(data)
+				eventData = append(eventData, []byte(data)...)
+			}
+
+			// Check context cancellation
 			select {
 			case <-ctx.Done():
-				h.log.Info("Streaming context canceled")
+				h.log.Info("Context canceled, stopping SSE processing")
 				return
 			default:
 				// Continue processing
 			}
+		}
 
-			// Read a line from the stream
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				if err == io.EOF {
-					h.log.Info("Streaming response completed")
-					return
-				}
-				h.log.WithError(err).Error("Error reading streaming response")
-				errChan <- fmt.Errorf("error reading streaming response: %w", err)
-				return
-			}
-
-			// Skip empty lines
-			line = bytes.TrimSpace(line)
-			if len(line) == 0 {
-				continue
-			}
-
-			// Check for data prefix
-			if !bytes.HasPrefix(line, []byte("data: ")) {
-				continue
-			}
-
-			// Extract the data part
-			data := bytes.TrimPrefix(line, []byte("data: "))
-
-			// Parse the data as JSON
-			var streamResp StreamingChatResponse
-			if err := json.Unmarshal(data, &streamResp); err != nil {
-				h.log.WithError(err).Error("Failed to parse streaming response chunk")
-				continue // Skip this chunk but continue processing
-			}
-
-			// Send the parsed response to the channel
-			select {
-			case responseChan <- streamResp:
-				// Successfully sent
-			case <-ctx.Done():
-				h.log.Info("Streaming context canceled while sending response")
-				return
+		// Check for scanner errors
+		if err := scanner.Err(); err != nil {
+			if err != io.EOF && !strings.Contains(err.Error(), "context canceled") {
+				h.log.WithError(err).Error("Error reading SSE stream")
+				errChan <- fmt.Errorf("error reading SSE stream: %w", err)
+			} else {
+				h.log.Info("SSE stream ended")
 			}
 		}
 	}()
 
 	return responseChan, errChan
+}
+
+// Helper function to process SSE events
+func processEvent(data []byte, responseChan chan StreamingChatResponse, log *logrus.Logger) {
+	// Skip empty data
+	if len(data) == 0 || string(data) == "" {
+		return
+	}
+
+	// Debug the raw data
+	if os.Getenv("DIFYGATE_DEBUG") == "true" {
+		log.WithField("event_data", string(data)).Debug("Processing SSE event data")
+	}
+
+	var response StreamingChatResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		log.WithError(err).WithField("data", string(data)).Error("Failed to parse SSE event data")
+		return
+	}
+
+	// Log the parsed response
+	log.WithFields(logrus.Fields{
+		"event":  response.Event,
+		"id":     response.ID,
+		"answer": response.Answer,
+	}).Info("Parsed SSE event")
+
+	// Send to channel
+	responseChan <- response
 }
