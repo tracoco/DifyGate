@@ -1,7 +1,6 @@
 package gateapi
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -187,10 +186,14 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 	// Enforce streaming mode
 	req.ResponseMode = "streaming"
 
+	// Create a context with cancel to allow forcing termination
+	_, cancelStream := context.WithCancel(ctx)
+
 	// Start processing in a goroutine
 	go func() {
 		defer close(responseChan)
 		defer close(errChan)
+		defer cancelStream()
 
 		// Prepare request to Dify API
 		difyReq := ChatMessageRequest{
@@ -228,7 +231,7 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 
 		// Set headers
 		httpReq.Header.Set("Content-Type", "application/json")
-		//httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Accept", "text/event-stream")
 		if h.difyAPIKey != "" {
 			httpReq.Header.Set("Authorization", "Bearer "+h.difyAPIKey)
 		}
@@ -268,33 +271,52 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 		// Log that we're starting to process the stream
 		h.log.Info("Starting to process Dify SSE stream")
 
-		// Process the SSE stream
-		scanner := bufio.NewScanner(resp.Body)
+		// Process the SSE stream using io.Reader
 		var eventData []byte
 
-		for scanner.Scan() {
-			line := scanner.Text()
-
-			// Debug each line received in the SSE stream
-			if os.Getenv("DIFYGATE_DEBUG") == "true" {
-				h.log.WithField("sse_line", line).Debug("Received SSE line")
-			}
-
-			// Empty line signals the end of an event
-			if line == "" {
-				if len(eventData) > 0 {
-					// Process complete event
-					processEvent(eventData, responseChan, h.log)
-					eventData = nil
+		for {
+			buf := make([]byte, 10240)
+			n, err := resp.Body.Read(buf)
+			if err != nil {
+				if err != io.EOF && !strings.Contains(err.Error(), "context canceled") {
+					h.log.WithError(err).Error("Error reading SSE stream")
+					errChan <- fmt.Errorf("error reading SSE stream: %w", err)
+				} else {
+					h.log.Info("SSE stream ended")
 				}
-				continue
+				break
 			}
 
-			// Lines starting with "data:" contain the event data
-			if strings.HasPrefix(line, "data:") {
-				data := strings.TrimPrefix(line, "data:")
-				data = strings.TrimSpace(data)
-				eventData = append(eventData, []byte(data)...)
+			data := buf[:n]
+			eventData = append(eventData, data...)
+
+			// Process complete events
+			for {
+				idx := bytes.Index(eventData, []byte("\n\n"))
+				if idx == -1 {
+					break
+				}
+
+				event := eventData[:idx]
+				eventData = eventData[idx+2:]
+
+				evtStr := string(event)
+				// Only process events that start with 'data:'
+				if strings.HasPrefix(evtStr, "data:") {
+					// Remove 'data:' prefix
+					event = event[5:]
+					// Process the event
+					processEvent(event, responseChan, h.log)
+					var response StreamingChatResponse
+					if err := json.Unmarshal(event, &response); err != nil {
+						h.log.WithError(err).WithField("data", string(event)).Error("Failed to parse SSE event data")
+						return
+					}
+					if response.Event == "message_end" {
+						h.log.Info("Parse SSE: Received message_end event, terminating stream")
+						return // Exit the processing goroutine
+					}
+				}
 			}
 
 			// Check context cancellation
@@ -306,17 +328,75 @@ func (h *DifyHandler) DifyChatMessageStreaming(ctx context.Context, req DifyChat
 				// Continue processing
 			}
 		}
-
-		// Check for scanner errors
-		if err := scanner.Err(); err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "context canceled") {
-				h.log.WithError(err).Error("Error reading SSE stream")
-				errChan <- fmt.Errorf("error reading SSE stream: %w", err)
-			} else {
-				h.log.Info("SSE stream ended")
-			}
-		}
 	}()
+	/* 		// Process the SSE stream
+	   		scanner := bufio.NewScanner(resp.Body)
+	   		var eventData []byte
+
+	   		select {
+	   		case <-time.After(5 * time.Second):
+	   			// Handle timeout - possibly close and retry
+
+	   			for scanner.Scan() {
+	   				line := scanner.Text()
+
+	   				// Debug each line received in the SSE stream
+	   				if os.Getenv("DIFYGATE_DEBUG") == "true" {
+	   					h.log.WithField("sse_line", line).Info("Received SSE line")
+	   				}
+
+	   				// Empty line signals the end of an event
+	   				if line == "" {
+	   					if len(eventData) > 0 {
+	   						// Parse the event
+	   						var response StreamingChatResponse
+	   						if err := json.Unmarshal(eventData, &response); err != nil {
+	   							h.log.WithError(err).WithField("data", string(eventData)).Error("Failed to parse SSE event data")
+	   						} else {
+	   							// Check if this is a terminal event
+	   							if response.Event == "message_end" {
+	   								h.log.Info("Parse SSE: Received message_end event, terminating stream")
+	   								responseChan <- response
+	   								cancelStream() // This will trigger connection closure
+	   								return         // Exit the processing goroutine
+	   							}
+
+	   							// Send the response
+	   							responseChan <- response
+	   						}
+	   						eventData = nil
+	   					}
+	   					continue
+	   				}
+
+	   				// Lines starting with "data:" contain the event data
+	   				if strings.HasPrefix(line, "data:") {
+	   					data := strings.TrimPrefix(line, "data:")
+	   					data = strings.TrimSpace(data)
+	   					eventData = append(eventData, []byte(data)...)
+	   				}
+
+	   				// Check context cancellation
+	   				select {
+	   				case <-ctx.Done():
+	   					h.log.Info("Context canceled, stopping SSE processing")
+	   					return
+	   				default:
+	   					// Continue processing
+	   				}
+	   			}
+	   		}
+
+	   		// Check for scanner errors
+	   		if err := scanner.Err(); err != nil {
+	   			if err != io.EOF && !strings.Contains(err.Error(), "context canceled") {
+	   				h.log.WithError(err).Error("Error reading SSE stream")
+	   				errChan <- fmt.Errorf("error reading SSE stream: %w", err)
+	   			} else {
+	   				h.log.Info("SSE stream ended")
+	   			}
+	   		}
+	   	}() */
 
 	return responseChan, errChan
 }

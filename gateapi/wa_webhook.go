@@ -155,8 +155,8 @@ func (h *WhatsAppHandler) HandleWhatsAppWebhookPost(c *gin.Context) {
 // processWhatsAppMessage handles the WhatsApp message processing and Dify integration
 func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBody, messageID string) {
 	// Send initial acknowledgment
-	initialResponse := "I'm processing your request..."
-	sendReplyMessage(phoneNumberID, from, initialResponse, messageID)
+	/* 	initialResponse := "I'm processing your request..."
+	   	sendReplyMessage(phoneNumberID, from, initialResponse, messageID) */
 
 	// Create context with reasonable timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -187,12 +187,12 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 
 	// Variables to build the complete response
 	var fullAnswer strings.Builder
-	var lastMessageSent time.Time
-	lastMessageSent = time.Now() // Initialize to now to prevent immediate send
+	//var lastMessageSent time.Time
+	//lastMessageSent = time.Now() // Initialize to now to prevent immediate send
 
 	// Constants for message handling
-	const minSendInterval = 3 * time.Second // Minimum time between messages (prevent rate limiting)
-	const minChunkSize = 100                // Minimum characters per message
+	const minSendInterval = 10 * time.Second // Minimum time between messages (prevent rate limiting)
+	const minChunkSize = 100                 // Minimum characters per message
 
 	// Process streaming responses
 	for {
@@ -242,7 +242,7 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 					fullAnswer.WriteString(resp.Answer)
 
 					// Check if we should send a partial message
-					if time.Since(lastMessageSent) >= minSendInterval && fullAnswer.Len() >= minChunkSize {
+					/* 					if time.Since(lastMessageSent) >= minSendInterval && fullAnswer.Len() >= minChunkSize {
 						partialResponse := fullAnswer.String()
 						h.log.WithField("partial_response", partialResponse).Info("Sending partial response")
 						sendReplyMessage(phoneNumberID, from, partialResponse, messageID)
@@ -250,7 +250,7 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 						// Reset and update timing
 						fullAnswer.Reset()
 						lastMessageSent = time.Now()
-					}
+					} */
 				}
 
 			case "message_end":
@@ -286,7 +286,7 @@ func (h *WhatsAppHandler) processWhatsAppMessage(phoneNumberID, from, messageBod
 
 				// Reset and update timing
 				fullAnswer.Reset()
-				lastMessageSent = time.Now()
+				//lastMessageSent = time.Now()
 			}
 		}
 	}
